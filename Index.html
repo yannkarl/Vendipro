@@ -1,0 +1,366 @@
+-- VENDIPRO DATABASE SCHEMA FOR SUPABASE
+
+CREATE TABLE public.profiles (
+    id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    email text,
+    full_name text,
+    business_name text,
+    phone text,
+    role text NOT NULL DEFAULT 'marchand' CHECK (role IN ('marchand', 'admin')),
+    plan text NOT NULL DEFAULT 'starter' CHECK (plan IN ('starter', 'business', 'premium')),
+    subscription_status text NOT NULL DEFAULT 'trial' CHECK (subscription_status IN ('trial', 'active', 'expired', 'suspended')),
+    trial_ends_at timestamptz NOT NULL DEFAULT (now() + interval '7 days'),
+    subscription_ends_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION public.is_admin()
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+STABLE
+SET search_path = ''
+AS $$
+  SELECT EXISTS (SELECT 1 FROM public.profiles p WHERE p.id = auth.uid() AND p.role = 'admin');
+$$;
+
+CREATE OR REPLACE FUNCTION public.has_active_access()
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+STABLE
+SET search_path = ''
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.profiles p 
+    WHERE p.id = auth.uid() AND (
+      p.role = 'admin' OR 
+      (p.subscription_status = 'active' AND p.subscription_ends_at IS NOT NULL AND p.subscription_ends_at > now()) OR 
+      (p.subscription_status = 'trial' AND p.trial_ends_at > now())
+    )
+  );
+$$;
+
+CREATE POLICY "profiles_select" ON public.profiles FOR SELECT USING (auth.uid() = id OR public.is_admin());
+CREATE POLICY "profiles_update_own" ON public.profiles FOR UPDATE USING (auth.uid() = id) WITH CHECK (auth.uid() = id);
+
+REVOKE UPDATE ON public.profiles FROM authenticated, anon;
+GRANT UPDATE (full_name, business_name, phone) ON public.profiles TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_chosen_plan text;
+BEGIN
+  v_chosen_plan := COALESCE(new.raw_user_meta_data ->> 'plan', 'starter');
+  IF v_chosen_plan NOT IN ('starter', 'business', 'premium') THEN
+    v_chosen_plan := 'starter';
+  END IF;
+  INSERT INTO public.profiles (id, email, full_name, business_name, phone, plan)
+  VALUES (new.id, new.email, new.raw_user_meta_data ->> 'full_name', new.raw_user_meta_data ->> 'business_name', new.raw_user_meta_data ->> 'phone', v_chosen_plan)
+  ON CONFLICT (id) DO NOTHING;
+  RETURN new;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+CREATE TABLE public.products (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 120),
+    purchase_price numeric(12,2) NOT NULL DEFAULT 0 CHECK (purchase_price >= 0),
+    sale_price numeric(12,2) NOT NULL DEFAULT 0 CHECK (sale_price >= 0),
+    quantity integer NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+    low_stock_threshold integer NOT NULL DEFAULT 5 CHECK (low_stock_threshold >= 0),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_products_user_id ON public.products(user_id);
+
+CREATE TABLE public.customers (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 120),
+    phone text,
+    email text,
+    address text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_customers_user_id ON public.customers(user_id);
+
+CREATE TABLE public.orders (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
+    customer_id uuid REFERENCES public.customers(id) ON DELETE SET NULL,
+    invoice_number text NOT NULL,
+    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'cancelled')),
+    total numeric(12,2) NOT NULL DEFAULT 0,
+    cost_total numeric(12,2) NOT NULL DEFAULT 0,
+    notes text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_orders_user_id ON public.orders(user_id, created_at DESC);
+
+CREATE TABLE public.order_items (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id uuid NOT NULL REFERENCES public.orders(id) ON DELETE CASCADE,
+    user_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
+    product_id uuid REFERENCES public.products(id) ON DELETE SET NULL,
+    product_name text NOT NULL,
+    quantity integer NOT NULL CHECK (quantity > 0),
+    unit_price numeric(12,2) NOT NULL,
+    unit_cost numeric(12,2) NOT NULL
+);
+CREATE INDEX idx_order_items_order_id ON public.order_items(order_id);
+
+CREATE TABLE public.expenses (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
+    label text NOT NULL CHECK (char_length(label) BETWEEN 1 AND 120),
+    category text NOT NULL DEFAULT 'autre',
+    amount numeric(12,2) NOT NULL CHECK (amount > 0),
+    spent_on date NOT NULL DEFAULT CURRENT_DATE,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_expenses_user_id ON public.expenses(user_id, spent_on DESC);
+
+DO $$ 
+DECLARE 
+  t text;
+BEGIN
+  FOR t IN SELECT unnest(ARRAY['products', 'customers', 'orders', 'order_items', 'expenses']) 
+  LOOP
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('CREATE POLICY "%1$s_select" ON public.%1$I FOR SELECT USING (auth.uid() = user_id AND public.has_active_access())', t);
+    EXECUTE format('CREATE POLICY "%1$s_insert" ON public.%1$I FOR INSERT WITH CHECK (auth.uid() = user_id AND public.has_active_access())', t);
+    EXECUTE format('CREATE POLICY "%1$s_update" ON public.%1$I FOR UPDATE USING (auth.uid() = user_id AND public.has_active_access()) WITH CHECK (auth.uid() = user_id)', t);
+    EXECUTE format('CREATE POLICY "%1$s_delete" ON public.%1$I FOR DELETE USING (auth.uid() = user_id AND public.has_active_access())', t);
+  END LOOP;
+END $$;
+
+CREATE TABLE public.payments (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
+    plan text NOT NULL CHECK (plan IN ('starter', 'business', 'premium')),
+    amount integer NOT NULL,
+    method text NOT NULL CHECK (method IN ('orange_money', 'wave', 'mtn_momo', 'moov_money')),
+    phone text NOT NULL,
+    reference text NOT NULL,
+    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    reviewed_at timestamptz
+);
+CREATE INDEX idx_payments_user_id ON public.payments(user_id);
+ALTER TABLE public.payments ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "payments_select" ON public.payments FOR SELECT USING (auth.uid() = user_id OR public.is_admin());
+
+CREATE OR REPLACE FUNCTION public.plan_price(p text)
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+SET search_path = ''
+AS $$
+  SELECT CASE p
+    WHEN 'starter' THEN 2500
+    WHEN 'business' THEN 5000
+    WHEN 'premium' THEN 10000
+  END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.submit_payment(p_plan text, p_method text, p_phone text, p_reference text)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  new_id uuid;
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Non authentifié';
+  END IF;
+  IF p_plan NOT IN ('starter', 'business', 'premium') THEN
+    RAISE EXCEPTION 'Plan invalide';
+  END IF;
+  IF p_method NOT IN ('orange_money', 'wave', 'mtn_momo', 'moov_money') THEN
+    RAISE EXCEPTION 'Méthode invalide';
+  END IF;
+  IF char_length(COALESCE(p_phone, '')) < 8 OR char_length(p_phone) > 20 THEN
+    RAISE EXCEPTION 'Numéro invalide';
+  END IF;
+  IF char_length(COALESCE(p_reference, '')) < 4 OR char_length(p_reference) > 60 THEN
+    RAISE EXCEPTION 'Référence invalide';
+  END IF;
+  IF (SELECT count(*) FROM public.payments WHERE user_id = auth.uid() AND status = 'pending') >= 3 THEN
+    RAISE EXCEPTION 'Trop de paiements en attente';
+  END IF;
+  INSERT INTO public.payments (user_id, plan, amount, method, phone, reference)
+  VALUES (auth.uid(), p_plan, public.plan_price(p_plan), p_method, p_phone, p_reference)
+  RETURNING id INTO new_id;
+  RETURN new_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.admin_review_payment(p_payment_id uuid, p_approve boolean)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  pay public.payments%rowtype;
+BEGIN
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'Accès refusé';
+  END IF;
+  SELECT * INTO pay FROM public.payments WHERE id = p_payment_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Paiement introuvable';
+  END IF;
+  IF pay.status <> 'pending' THEN
+    RAISE EXCEPTION 'Paiement déjà traité';
+  END IF;
+  UPDATE public.payments 
+  SET status = CASE WHEN p_approve THEN 'approved' ELSE 'rejected' END, 
+      reviewed_at = now() 
+  WHERE id = p_payment_id;
+  IF p_approve THEN
+    UPDATE public.profiles 
+    SET plan = pay.plan, 
+        subscription_status = 'active', 
+        subscription_ends_at = GREATEST(COALESCE(subscription_ends_at, now()), now()) + INTERVAL '30 days' 
+    WHERE id = pay.user_id;
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.admin_set_subscription(p_user_id uuid, p_status text, p_plan text, p_days integer)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'Accès refusé';
+  END IF;
+  IF p_status NOT IN ('trial', 'active', 'expired', 'suspended') THEN
+    RAISE EXCEPTION 'Statut invalide';
+  END IF;
+  IF p_plan NOT IN ('starter', 'business', 'premium') THEN
+    RAISE EXCEPTION 'Plan invalide';
+  END IF;
+  UPDATE public.profiles 
+  SET subscription_status = p_status, 
+      plan = p_plan, 
+      subscription_ends_at = CASE WHEN p_status = 'active' THEN GREATEST(COALESCE(subscription_ends_at, now()), now()) + make_interval(days => GREATEST(COALESCE(p_days, 30), 1)) ELSE subscription_ends_at END, 
+      trial_ends_at = CASE WHEN p_status = 'trial' THEN now() + make_interval(days => GREATEST(COALESCE(p_days, 7), 1)) ELSE trial_ends_at END 
+  WHERE id = p_user_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.create_order(p_customer_id uuid, p_items jsonb, p_status text, p_notes text)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+DECLARE
+  new_id uuid;
+  item jsonb;
+  prod public.products%rowtype;
+  qty integer;
+  v_total numeric := 0;
+  v_cost numeric := 0;
+  v_count integer;
+  v_invoice text;
+BEGIN
+  IF auth.uid() IS NULL OR NOT public.has_active_access() THEN
+    RAISE EXCEPTION 'Accès refusé';
+  END IF;
+  IF p_status NOT IN ('pending', 'delivered') THEN
+    RAISE EXCEPTION 'Statut invalide';
+  END IF;
+  IF jsonb_typeof(p_items) <> 'array' OR jsonb_array_length(p_items) = 0 OR jsonb_array_length(p_items) > 50 THEN
+    RAISE EXCEPTION 'Articles invalides';
+  END IF;
+  IF p_customer_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM public.customers WHERE id = p_customer_id AND user_id = auth.uid()) THEN
+    RAISE EXCEPTION 'Client invalide';
+  END IF;
+  SELECT COUNT(*) + 1 INTO v_count FROM public.orders WHERE user_id = auth.uid();
+  v_invoice := 'FAC-' || to_char(now(), 'YYYY') || '-' || lpad(v_count::text, 4, '0');
+  
+  INSERT INTO public.orders (user_id, customer_id, invoice_number, status, notes)
+  VALUES (auth.uid(), p_customer_id, v_invoice, p_status, left(p_notes, 500))
+  RETURNING id INTO new_id;
+
+  FOR item IN SELECT * FROM jsonb_array_elements(p_items) LOOP
+    qty := (item ->> 'quantity')::integer;
+    IF qty IS NULL OR qty <= 0 OR qty > 10000 THEN
+      RAISE EXCEPTION 'Quantité invalide';
+    END IF;
+    SELECT * INTO prod FROM public.products WHERE id = (item ->> 'product_id')::uuid AND user_id = auth.uid() FOR UPDATE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Produit introuvable';
+    END IF;
+    IF prod.quantity < qty THEN
+      RAISE EXCEPTION 'Stock insuffisant pour %', prod.name;
+    END IF;
+    UPDATE public.products SET quantity = quantity - qty WHERE id = prod.id;
+    INSERT INTO public.order_items (order_id, user_id, product_id, product_name, quantity, unit_price, unit_cost)
+    VALUES (new_id, auth.uid(), prod.id, prod.name, qty, prod.sale_price, prod.purchase_price);
+    v_total := v_total + prod.sale_price * qty;
+    v_cost := v_cost + prod.purchase_price * qty;
+  END LOOP;
+
+  UPDATE public.orders SET total = v_total, cost_total = v_cost WHERE id = new_id;
+  RETURN new_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.update_order_status(p_order_id uuid, p_status text)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+DECLARE
+  o public.orders%rowtype;
+BEGIN
+  IF p_status NOT IN ('pending', 'delivered', 'cancelled') THEN
+    RAISE EXCEPTION 'Statut invalide';
+  END IF;
+  SELECT * INTO o FROM public.orders WHERE id = p_order_id AND user_id = auth.uid() FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Commande introuvable';
+  END IF;
+  IF o.status = p_status THEN
+    RETURN;
+  END IF;
+  IF o.status = 'cancelled' THEN
+    RAISE EXCEPTION 'Une commande annulée ne peut pas être réactivée';
+  END IF;
+  IF p_status = 'cancelled' THEN
+    UPDATE public.products pr 
+    SET quantity = pr.quantity + oi.quantity 
+    FROM public.order_items oi 
+    WHERE oi.order_id = o.id AND oi.product_id = pr.id AND pr.user_id = auth.uid();
+  END IF;
+  UPDATE public.orders SET status = p_status WHERE id = o.id;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION public.admin_review_payment(uuid, boolean) FROM anon;
+REVOKE EXECUTE ON FUNCTION public.admin_set_subscription(uuid, text, text, integer) FROM anon;
+REVOKE EXECUTE ON FUNCTION public.submit_payment(text, text, text, text) FROM anon;
+REVOKE EXECUTE ON FUNCTION public.create_order(uuid, jsonb, text, text) FROM anon;
+REVOKE EXECUTE ON FUNCTION public.update_order_status(uuid, text) FROM anon;
